@@ -1,0 +1,31 @@
+{
+  "name": "Emma Navarro",
+  "symbol": "ENAV",
+  "description": "Official Emma Navarro SPL Token — Focus, Grit, Heart. A champion's mindset, tokenized on Solana.",
+  "image": "https://raw.githubusercontent.com/m0hammadgh/DEX-Trade/master/assets/emma-navarro-token.jpg",
+  "external_url": "https://github.com/m0hammadgh/DEX-Trade",
+  "attributes": [
+    {
+      "trait_type": "Focus",
+      "value": "100"
+    },
+    {
+      "trait_type": "Grit",
+      "value": "100"
+    },
+    {
+      "trait_type": "Heart",
+      "value": "100"
+    }
+  ],
+  "properties": {
+    "category": "image",
+    "files": [
+      {
+        "uri": "https://raw.githubusercontent.com/m0hammadgh/DEX-Trade/master/assets/emma-navarro-token.jpg",
+        "type": "image/jpeg",
+        "cdn": true
+      }
+    ]
+  }
+}
