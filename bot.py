@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DEX-Trade Bot v1.0
+DEX-Trade Bot v1.1
 Monitors BITFA DEX Telegram channel for trading signals
 Executes buys/sells on Solana via Jupiter + pump.fun
 """
@@ -15,6 +15,7 @@ from solana.rpc.commitment import Confirmed
 API_ID = 41025
 API_HASH = "fb0a10e0610addd9cbd4e50bdd162618"
 BITFA_CHAT_ID = -1002395777754
+NOTIFY_URL = "https://notification.lmtheme.com/api/notify"
 
 # Load wallet keys
 with open("/tmp/wallet_keys.json") as f:
@@ -35,6 +36,19 @@ PUMPFUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 # Track positions: symbol -> {contract, buy_amount_sol, entry_price}
 positions = {}
+
+# ====== NOTIFICATION ======
+
+def send_notification(subject, text):
+    """Send notification to Telegram bot via HTTP POST"""
+    try:
+        r = requests.post(NOTIFY_URL, data={"subject": subject, "text": text}, timeout=10)
+        if r.status_code == 200:
+            print(f"   📬 Notification sent: {subject}")
+        else:
+            print(f"   ⚠️ Notification HTTP {r.status_code}: {r.text[:80]}")
+    except Exception as e:
+        print(f"   ⚠️ Notification error: {e}")
 
 # ====== HELPER FUNCTIONS ======
 
@@ -132,7 +146,8 @@ def extract_signal(text):
 
 async def execute_buy(contract_str, signal_info):
     """Buy token using Jupiter API"""
-    print(f"\n🟢 BUY signal: ${signal_info['coin']}")
+    coin = signal_info.get("coin", "Unknown")
+    print(f"\n🟢 BUY signal: ${coin}")
     print(f"   Contract: {contract_str[:20]}...")
     
     # Get available balance
@@ -143,10 +158,12 @@ async def execute_buy(contract_str, signal_info):
     trade_amount = (sol_bal - 0.005) * 0.5  # Half of available
     if trade_amount <= 0:
         print(f"   ❌ Insufficient SOL for trade")
+        send_notification("❌ Buy Failed", f"${coin}\nReason: Insufficient SOL (balance: {sol_bal:.4f})")
         return False
     
     trade_lamports = int(trade_amount * 1e9)
     print(f"   Trading {trade_amount:.4f} SOL")
+    send_notification("🟢 Buy Signal", f"${coin}\nAmount: {trade_amount:.4f} SOL\nBalance: {sol_bal:.4f} SOL\nContract: {contract_str[:20]}...")
     
     # Get Jupiter quote
     try:
@@ -158,7 +175,9 @@ async def execute_buy(contract_str, signal_info):
         }, timeout=10)
         
         if resp.status_code != 200 or "error" in resp.text:
-            print(f"   ❌ Jupiter quote error: {resp.text[:100]}")
+            err = f"Jupiter quote error: {resp.text[:100]}"
+            print(f"   ❌ {err}")
+            send_notification("❌ Buy Failed", f"${coin}\n{err}")
             return False
         
         quote = resp.json()
@@ -174,7 +193,9 @@ async def execute_buy(contract_str, signal_info):
         }, timeout=10)
         
         if swap_resp.status_code != 200:
-            print(f"   ❌ Swap tx error: {swap_resp.text[:100]}")
+            err = f"Swap tx error: {swap_resp.text[:100]}"
+            print(f"   ❌ {err}")
+            send_notification("❌ Buy Failed", f"${coin}\n{err}")
             return False
         
         swap_data = swap_resp.json()
@@ -190,19 +211,42 @@ async def execute_buy(contract_str, signal_info):
         
         async with AsyncClient(SOLANA_RPC) as client:
             sig = await client.send_raw_transaction(bytes(signed))
-            print(f"   ✅ TX sent: {sig}")
+            sig_str = str(sig)
+            print(f"   ✅ TX sent: {sig_str}")
+            
+            # Store position
+            positions[coin] = {
+                "contract": contract_str,
+                "buy_amount_sol": trade_amount,
+                "entry_price": signal_info.get("entry_price", 0),
+                "tx_sig": sig_str,
+            }
             
             # Wait for confirmation
             await asyncio.sleep(3)
+            
+            # Get new balance after buy
+            new_bal = await get_sol_balance()
+            sol_spent = sol_bal - new_bal
+            
+            send_notification("✅ Buy Executed", 
+                f"${coin}\n"
+                f"Spent: {sol_spent:.4f} SOL\n"
+                f"Tokens: {out_amount:.9f}\n"
+                f"New Balance: {new_bal:.4f} SOL\n"
+                f"TX: {sig_str[:30]}...")
+            
             return True
             
     except Exception as e:
         print(f"   ❌ Buy error: {e}")
+        send_notification("❌ Buy Error", f"${coin}\nError: {str(e)[:150]}")
         return False
 
 async def execute_sell(contract_str, signal_info):
     """Sell token using Jupiter API"""
-    print(f"\n🔴 SELL signal: ${signal_info['coin']}")
+    coin = signal_info.get("coin", "Unknown")
+    print(f"\n🔴 SELL signal: ${coin}")
     
     # Get token balance
     token_ui, token_raw, token_decimals = await get_token_balance_and_info(contract_str)
@@ -210,16 +254,32 @@ async def execute_sell(contract_str, signal_info):
     
     if token_ui <= 0:
         print(f"   ❌ No tokens to sell")
+        send_notification("🔴 Sell Failed", f"${coin}\nReason: No tokens to sell")
         return False
     
+    # Get buy info for P&L calculation
+    buy_info = None
+    # Find position by coin name or contract
+    for sym, pos in positions.items():
+        if coin.lower() in sym.lower() or pos.get("contract") == contract_str:
+            buy_info = pos
+            break
+    
+    buy_sol = buy_info.get("buy_amount_sol", 0) if buy_info else 0
+    bal_before = await get_sol_balance()
+    
     # Determine sell amount (in raw units)
-    if signal_info["sell_type"] == "capital":
-        # Sell 50% (recover capital)
+    if signal_info.get("sell_type") == "capital":
         sell_amount = int(token_raw * 0.5)
-    elif signal_info["sell_type"] == "full":
-        sell_amount = int(token_raw * 0.7)  # 70%
+        sell_label = "capital (50%)"
+    elif signal_info.get("sell_type") == "full":
+        sell_amount = int(token_raw * 0.7)
+        sell_label = "partial (70%)"
     else:
-        sell_amount = token_raw  # all
+        sell_amount = token_raw
+        sell_label = "full (100%)"
+    
+    send_notification("🔴 Sell Signal", f"${coin}\nType: {sell_label}\nTokens: {token_ui:.9f}\nBuy Cost: {buy_sol:.4f} SOL\nCurrent Balance: {bal_before:.4f} SOL")
     
     # Get Jupiter quote for token → SOL
     try:
@@ -231,7 +291,9 @@ async def execute_sell(contract_str, signal_info):
         }, timeout=10)
         
         if resp.status_code != 200 or "error" in resp.text:
-            print(f"   ❌ Sell quote error: {resp.text[:100]}")
+            err = f"Sell quote error: {resp.text[:100]}"
+            print(f"   ❌ {err}")
+            send_notification("❌ Sell Failed", f"${coin}\n{err}")
             return False
         
         quote = resp.json()
@@ -246,7 +308,9 @@ async def execute_sell(contract_str, signal_info):
         }, timeout=10)
         
         if swap_resp.status_code != 200:
-            print(f"   ❌ Sell tx error: {swap_resp.text[:100]}")
+            err = f"Sell tx error: {swap_resp.text[:100]}"
+            print(f"   ❌ {err}")
+            send_notification("❌ Sell Failed", f"${coin}\n{err}")
             return False
         
         swap_data = swap_resp.json()
@@ -261,11 +325,43 @@ async def execute_sell(contract_str, signal_info):
         
         async with AsyncClient(SOLANA_RPC) as client:
             sig = await client.send_raw_transaction(bytes(signed))
-            print(f"   ✅ Sell TX sent: {sig}")
+            sig_str = str(sig)
+            print(f"   ✅ Sell TX sent: {sig_str}")
+            
+            # Wait for confirmation then check balance
+            await asyncio.sleep(3)
+            new_bal = await get_sol_balance()
+            sol_received = new_bal - bal_before
+            
+            # Calculate P&L
+            if buy_sol > 0 and sol_received > 0:
+                pnl_sol = sol_received - buy_sol
+                pnl_pct = (pnl_sol / buy_sol) * 100
+                pnl_emoji = "🟢" if pnl_sol >= 0 else "🔴"
+                pnl_str = f"{pnl_emoji} P&L: {pnl_sol:+.4f} SOL ({pnl_pct:+.2f}%)"
+            else:
+                pnl_str = "P&L: N/A (no buy record)"
+            
+            # Clean up position
+            for sym in list(positions.keys()):
+                if coin.lower() in sym.lower() or positions[sym].get("contract") == contract_str:
+                    del positions[sym]
+                    break
+            
+            send_notification("✅ Sell Executed", 
+                f"${coin}\n"
+                f"Type: {sell_label}\n"
+                f"Sold For: {sol_received:.4f} SOL\n"
+                f"Buy Cost: {buy_sol:.4f} SOL\n"
+                f"{pnl_str}\n"
+                f"New Balance: {new_bal:.4f} SOL\n"
+                f"TX: {sig_str[:30]}...")
+            
             return True
             
     except Exception as e:
         print(f"   ❌ Sell error: {e}")
+        send_notification("❌ Sell Error", f"${coin}\nError: {str(e)[:150]}")
         return False
 
 # ====== TELEGRAM HANDLER ======
@@ -282,6 +378,7 @@ async def handle_signal(signal_info):
     
     if signal_info["chain"] != "SOL":
         print("   ⏭️ Skipping non-SOL chain signal")
+        send_notification("⏭️ Skipped (Non-SOL)", f"Chain: {signal_info['chain']}\nCoin: {signal_info.get('coin', 'N/A')}\n{signal_info['raw'][:80]}")
         return
     
     if signal_info["is_buy"] and signal_info["contract"]:
@@ -293,18 +390,19 @@ async def handle_signal(signal_info):
         contract_to_sell = ""
         
         if coin and coin in positions:
-            contract_to_sell = positions[coin]
+            contract_to_sell = positions[coin].get("contract", "")
         else:
             # Search positions by partial match
-            for sym, addr in positions.items():
+            for sym, pos in positions.items():
                 if coin.lower() in sym.lower():
-                    contract_to_sell = addr
+                    contract_to_sell = pos.get("contract", "")
                     break
         
         if contract_to_sell:
             await execute_sell(contract_to_sell, signal_info)
         else:
             print(f"   ℹ️ No open position for ${coin}")
+            send_notification("ℹ️ No Position", f"${coin}\nSell signal but no open position found.")
 
 async def main():
     print("🚀 DEX-Trade Bot Starting...")
@@ -313,6 +411,7 @@ async def main():
     # Check initial balance
     bal = await get_sol_balance()
     print(f"   Balance: {bal:.6f} SOL")
+    send_notification("🚀 Bot Started", f"Wallet: {SOLANA_ADDR[:8]}...{SOLANA_ADDR[-4:]}\nBalance: {bal:.4f} SOL\nMonitoring: BITFA DEX")
     
     # Start Telethon client
     client = TelegramClient("/root/bitfa_session", API_ID, API_HASH,
@@ -324,6 +423,7 @@ async def main():
     await client.connect()
     if not await client.is_user_authorized():
         print("❌ Not authorized! Run QR login first.")
+        send_notification("❌ Bot Error", "Not authorized! QR login needed.")
         return
     
     me = await client.get_me()
@@ -346,7 +446,11 @@ async def main():
     print("\n✅ Bot is running! Listening for signals...")
     print("   (Press Ctrl+C to stop)")
     
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        bal_final = await get_sol_balance()
+        send_notification("⛔ Bot Stopped", f"Final Balance: {bal_final:.4f} SOL\nOpen Positions: {len(positions)}")
 
 if __name__ == "__main__":
     try:
